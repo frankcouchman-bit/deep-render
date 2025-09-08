@@ -1,17 +1,22 @@
-# ✅ Uses Playwright's official image that bundles Chromium/ffmpeg/fonts/deps
-FROM mcr.microsoft.com/playwright:v1.47.0-jammy
+# Use a Playwright image that bundles the right Chromium version
+FROM mcr.microsoft.com/playwright:v1.55.0-jammy
 
+# App dir
 WORKDIR /app
 
-# Install app deps
+# Install only prod deps
 COPY package*.json ./
-# Try ci first; fall back to i on first deploy
-RUN npm ci --omit=dev || npm i --omit=dev
+RUN npm i --omit=dev
 
-# Copy app code
+# Copy source
 COPY . .
 
-ENV PORT=8080
-EXPOSE 8080
+# Playwright env (match what our server expects)
+ENV PORT=10000
+ENV NODE_ENV=production
 
-CMD ["node", "server.js"]
+# Optional: speed up cold starts
+RUN npx playwright --version
+
+EXPOSE 10000
+CMD ["node", "app.js"]

@@ -1,51 +1,50 @@
 import express from "express";
-import bodyParser from "body-parser";
 import { chromium } from "playwright";
 
 const app = express();
-app.use(bodyParser.json({ limit: "1mb" }));
+app.use(express.json({ limit: "512kb" }));
 
-// Optional bearer auth; if set on Render, the Worker will send this header.
-const AUTH = process.env.RENDER_API_KEY || "";
+// optional auth: set API_KEY in Render (then set same as RENDER_API_KEY in Worker)
+const mustAuth = !!process.env.API_KEY;
+function checkAuth(req, res, next) {
+  if (!mustAuth) return next();
+  const got = req.get("authorization") || "";
+  const want = `Bearer ${process.env.API_KEY}`;
+  if (got === want) return next();
+  return res.status(401).json({ error: "unauthorized" });
+}
 
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
-app.post("/render", async (req, res) => {
+app.post("/render", checkAuth, async (req, res) => {
+  const { url, waitUntil = "networkidle", timeoutMs = 60000 } = req.body || {};
+  if (!url || !/^https?:\/\//i.test(url)) {
+    return res.status(400).json({ error: "Missing or invalid url" });
+  }
+
+  let browser;
   try {
-    if (AUTH) {
-      const hdr = req.get("authorization") || "";
-      if (hdr !== `Bearer ${AUTH}`) return res.status(401).json({ error: "unauthorized" });
-    }
-
-    const { url, waitUntil = "networkidle", timeoutMs = 30000 } = req.body || {};
-    if (!url || !/^https?:\/\//i.test(url)) return res.status(400).json({ error: "bad_url" });
-
-    const browser = await chromium.launch({
-      args: ["--no-sandbox", "--disable-dev-shm-usage"],
-      headless: true
+    browser = await chromium.launch({
+      args: ["--no-sandbox", "--disable-gpu"]
     });
     const ctx = await browser.newContext({
-      userAgent: "Mozilla/5.0 (compatible; A11yDeepRender/1.0)"
+      userAgent: "Mozilla/5.0 (compatible; DeepRender/1.0; +https://render.com)",
+      javaScriptEnabled: true,
+      ignoreHTTPSErrors: true,
+      viewport: { width: 1366, height: 768 }
     });
     const page = await ctx.newPage();
-
-    let finalUrl = url;
-    try {
-      await page.goto(url, { waitUntil, timeout: timeoutMs });
-      finalUrl = page.url();
-      await page.waitForTimeout(500); // small settle for SPA updates
-    } catch (_) { /* allow partial loads */ }
-
+    await page.goto(url, { waitUntil, timeout: timeoutMs });
     const html = await page.content();
-    await ctx.close();
-    await browser.close();
-
-    res.json({ html, url: finalUrl, status: 200 });
+    return res.json({ ok: true, url: page.url(), html });
   } catch (e) {
-    console.error("render error:", e);
-    res.status(500).json({ error: "render_failed", detail: String(e) });
+    return res.status(500).json({ error: String(e) });
+  } finally {
+    if (browser) await browser.close();
   }
 });
 
 const port = process.env.PORT || 8080;
-app.listen(port, () => console.log("Deep Render listening on :" + port));
+app.listen(port, "0.0.0.0", () => {
+  console.log("Deep Render listening on", port);
+});

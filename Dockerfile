@@ -1,14 +1,14 @@
-# Headless Chromium + fonts + everything preinstalled
-FROM mcr.microsoft.com/playwright:v1.47.2-jammy
+# Use the official Playwright image with all deps
+FROM mcr.microsoft.com/playwright:v1.46.0-jammy
 
 WORKDIR /app
-COPY package*.json ./
+COPY package.json package-lock.json* ./
 RUN npm ci --omit=dev
-COPY . .
 
-# Render injects PORT; your server MUST listen on it
-ENV NODE_ENV=production
+COPY server.js ./server.js
+
 ENV PORT=8080
 EXPOSE 8080
 
+# playwright image already has browsers installed
 CMD ["node", "server.js"]

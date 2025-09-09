@@ -1,35 +1,17 @@
 import express from "express";
 import morgan from "morgan";
-import { chromium } from "playwright";
+import { chromium } from "playwright"; // <-- use runtime package
 
-// ---- Config -----------------------------------------------------------------
-const PORT = Number(process.env.PORT || 8080);
-const API_KEY = process.env.RENDER_API_KEY || ""; // optional: require Bearer
-const DEFAULT_TIMEOUT = 25000; // ms
-const MAX_TIMEOUT = 60000;     // ms
-const MIN_TIMEOUT = 5000;      // ms
+const PORT = process.env.PORT || 8080;
+const API_KEY = process.env.RENDER_API_KEY || ""; // optional: require Bearer if set
 
-// ---- App --------------------------------------------------------------------
 const app = express();
-app.disable("x-powered-by");
 app.use(express.json({ limit: "1mb" }));
 app.use(morgan("tiny"));
 
-// (Optional) very permissive CORS so you can hit it directly in a pinch.
-// Not required for Worker->Renderer server-to-server calls.
-app.use((req, res, next) => {
-  const origin = req.headers.origin || "*";
-  res.setHeader("Access-Control-Allow-Origin", origin);
-  res.setHeader("Vary", "Origin");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  res.setHeader("Access-Control-Allow-Methods", "POST,GET,OPTIONS");
-  if (req.method === "OPTIONS") return res.status(204).end();
-  next();
-});
-
-// Health
+// Health + root
 app.get("/", (_req, res) => res.json({ ok: true, name: "wcag-renderer" }));
-app.get("/health", (_req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
+app.get("/health", (_req, res) => res.json({ ok: true, name: "wcag-renderer" }));
 
 // Optional API key auth
 app.use((req, res, next) => {
@@ -39,29 +21,16 @@ app.use((req, res, next) => {
   return res.status(401).json({ error: "Unauthorized" });
 });
 
-// ---- Helpers ----------------------------------------------------------------
-function clampTimeout(ms) {
-  const n = Number(ms || DEFAULT_TIMEOUT);
-  return Math.min(MAX_TIMEOUT, Math.max(MIN_TIMEOUT, n));
-}
-
-function buildLaunchArgs() {
-  // Docker-friendly Chromium flags
-  return [
-    "--no-sandbox",
-    "--disable-setuid-sandbox",
-    "--disable-dev-shm-usage",
-    "--disable-gpu",
-    "--no-zygote",
-    "--single-process" // helps on some constrained hosts
-  ];
-}
-
-// ---- Render endpoint ---------------------------------------------------------
+/**
+ * POST /render
+ * { url: string, waitUntil?: "domcontentloaded"|"load"|"networkidle", timeoutMs?: number }
+ */
 app.post("/render", async (req, res) => {
   const url = String(req.body?.url || "").trim();
-  const waitUntil = String(req.body?.waitUntil || "networkidle"); // 'load'|'domcontentloaded'|'networkidle'
-  const timeoutMs = clampTimeout(req.body?.timeoutMs);
+  const waitUntil = ["domcontentloaded", "load", "networkidle"].includes(req.body?.waitUntil)
+    ? req.body.waitUntil
+    : "networkidle";
+  const timeoutMs = Math.min(60000, Math.max(5000, Number(req.body?.timeoutMs || 25000)));
 
   if (!/^https?:\/\//i.test(url)) {
     return res.status(400).json({ error: "Invalid url" });
@@ -71,13 +40,20 @@ app.post("/render", async (req, res) => {
   try {
     browser = await chromium.launch({
       headless: true,
-      args: buildLaunchArgs()
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--no-zygote"
+      ]
     });
 
     const context = await browser.newContext({
       viewport: { width: 1366, height: 768 },
       userAgent:
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119 Safari/537.36 A11yRenderer/1.0",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) " +
+        "Chrome/119 Safari/537.36 A11yRenderer/1.0",
       javaScriptEnabled: true,
       ignoreHTTPSErrors: true,
       locale: "en-US",
@@ -86,39 +62,38 @@ app.post("/render", async (req, res) => {
 
     const page = await context.newPage();
 
-    // Block heavy resources to speed up (images, media, fonts)
+    // Block heavy assets to speed up
     await page.route("**/*", (route) => {
       const type = route.request().resourceType();
-      if (type === "image" || type === "media" || type === "font") return route.abort();
+      if (["image", "media", "font"].includes(type)) return route.abort();
       return route.continue();
     });
 
-    // First navigation: be conservative to get *something* quickly
-    let nav = await page.goto(url, {
-      waitUntil: "domcontentloaded",
-      timeout: timeoutMs
-    }).catch(e => ({ _err: e }));
-
-    if (!nav || nav._err) {
-      // Retry once with routing disabled (some CSP/redirect chains dislike routing)
-      try { await page.unroute("**/*"); } catch {}
-      nav = await page.goto(url, {
-        waitUntil: "domcontentloaded",
-        timeout: timeoutMs
-      }).catch(e => ({ _err: e }));
-      if (!nav || nav._err) {
+    // First try with blocking…
+    const first = await page
+      .goto(url, { waitUntil: "domcontentloaded", timeout: timeoutMs })
+      .catch((e) => ({ _err: e }));
+    if (!first || first._err) {
+      // …fallback without blocking
+      await page.unroute("**/*");
+      const second = await page
+        .goto(url, { waitUntil: "domcontentloaded", timeout: timeoutMs })
+        .catch((e) => ({ _err: e }));
+      if (!second || second._err) {
         throw new Error("Navigation failed or timed out");
       }
     }
 
-    // Then try to satisfy the caller's requested readiness
-    // Cap the wait to avoid hanging indefinitely on chatty apps.
-    await page.waitForLoadState(waitUntil, {
-      timeout: Math.min(20000, timeoutMs)
-    }).catch(() => { /* swallow if it never reaches networkidle */ });
+    // Try to wait for network to settle (but don’t hang forever)
+    await Promise.race([
+      page.waitForLoadState(waitUntil, {
+        timeout: Math.max(5000, Math.min(20000, timeoutMs))
+      }).catch(() => {}),
+      new Promise((r) => setTimeout(r, Math.min(timeoutMs, 20000)))
+    ]);
 
-    // Small deterministic delay to let client JS mutate DOM
-    await page.waitForTimeout(1500);
+    // Small fixed delay to let client JS mutate DOM
+    await new Promise((r) => setTimeout(r, 1500));
 
     const content = await page.content();
     const finalUrl = page.url();
@@ -132,11 +107,6 @@ app.post("/render", async (req, res) => {
   }
 });
 
-// ---- Server start ------------------------------------------------------------
-const server = app.listen(PORT, "0.0.0.0", () => {
+app.listen(PORT, () => {
   console.log(`Render API listening on :${PORT}`);
 });
-
-// Keep-alive settings to behave nicely behind proxies
-server.keepAliveTimeout = 61_000;
-server.headersTimeout = 65_000;

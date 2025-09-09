@@ -1,14 +1,19 @@
-# Use the official Playwright image with all deps
+# Use the official Playwright image with all dependencies & browsers
 FROM mcr.microsoft.com/playwright:v1.46.0-jammy
 
 WORKDIR /app
-COPY package.json package-lock.json* ./
-RUN npm ci --omit=dev
 
+# Install only production deps (no need for dev/test libs)
+COPY package.json package-lock.json* ./
+RUN npm install --omit=dev
+
+# App code
 COPY server.js ./server.js
 
 ENV PORT=8080
 EXPOSE 8080
 
-# playwright image already has browsers installed
+# Run as the default user from the Playwright image (pwuser) for safety
+USER pwuser
+
 CMD ["node", "server.js"]

@@ -1,50 +1,94 @@
 import express from "express";
-import { chromium } from "playwright";
+import morgan from "morgan";
+import { chromium } from "@playwright/test";
+
+const PORT = process.env.PORT || 8080;
+const API_KEY = process.env.RENDER_API_KEY || ""; // optional, set to require Bearer
 
 const app = express();
-app.use(express.json({ limit: "512kb" }));
+app.use(express.json({ limit: "1mb" }));
+app.use(morgan("tiny"));
 
-// optional auth: set API_KEY in Render (then set same as RENDER_API_KEY in Worker)
-const mustAuth = !!process.env.API_KEY;
-function checkAuth(req, res, next) {
-  if (!mustAuth) return next();
-  const got = req.get("authorization") || "";
-  const want = `Bearer ${process.env.API_KEY}`;
-  if (got === want) return next();
-  return res.status(401).json({ error: "unauthorized" });
-}
+// simple health
+app.get("/health", (_, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 
-app.get("/health", (_req, res) => res.json({ ok: true }));
+// optional API key auth
+app.use((req, res, next) => {
+  if (!API_KEY) return next();
+  const h = req.get("authorization") || "";
+  if (h === `Bearer ${API_KEY}`) return next();
+  return res.status(401).json({ error: "Unauthorized" });
+});
 
-app.post("/render", checkAuth, async (req, res) => {
-  const { url, waitUntil = "networkidle", timeoutMs = 60000 } = req.body || {};
-  if (!url || !/^https?:\/\//i.test(url)) {
-    return res.status(400).json({ error: "Missing or invalid url" });
+app.post("/render", async (req, res) => {
+  const url = String(req.body?.url || "").trim();
+  const waitUntil = req.body?.waitUntil || "networkidle"; // domcontentloaded | load | networkidle
+  const timeoutMs = Math.min(60000, Math.max(5000, Number(req.body?.timeoutMs || 25000)));
+
+  if (!/^https?:\/\//i.test(url)) {
+    return res.status(400).json({ error: "Invalid url" });
   }
 
   let browser;
   try {
     browser = await chromium.launch({
-      args: ["--no-sandbox", "--disable-gpu"]
+      headless: true,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--no-zygote"
+      ]
     });
-    const ctx = await browser.newContext({
-      userAgent: "Mozilla/5.0 (compatible; DeepRender/1.0; +https://render.com)",
+    const context = await browser.newContext({
+      viewport: { width: 1366, height: 768 },
+      userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119 Safari/537.36 A11yRenderer/1.0",
       javaScriptEnabled: true,
       ignoreHTTPSErrors: true,
-      viewport: { width: 1366, height: 768 }
+      // useful for sites with locales/consent
+      locale: "en-US",
+      timezoneId: "UTC"
     });
-    const page = await ctx.newPage();
-    await page.goto(url, { waitUntil, timeout: timeoutMs });
-    const html = await page.content();
-    return res.json({ ok: true, url: page.url(), html });
+    const page = await context.newPage();
+
+    // block heavy resources to speed up
+    await page.route("**/*", (route) => {
+      const r = route.request();
+      const type = r.resourceType();
+      if (["image", "media", "font"].includes(type)) return route.abort();
+      return route.continue();
+    });
+
+    const nav = await page.goto(url, { waitUntil: "domcontentloaded", timeout: timeoutMs }).catch(e => ({ _err: e }));
+    if (!nav || nav._err) {
+      // last-ditch try without blocking
+      await page.unroute("**/*");
+      const nav2 = await page.goto(url, { waitUntil: "domcontentloaded", timeout: timeoutMs }).catch(e => ({ _err: e }));
+      if (!nav2 || nav2._err) {
+        throw new Error("Navigation failed or timed out");
+      }
+    }
+
+    // wait for network to settle but with cap
+    const settle = page.waitForLoadState(waitUntil, { timeout: Math.max(5000, Math.min(20000, timeoutMs)) })
+      .catch(() => {}); // ignore if networkidle never happens
+    // also wait a small fixed delay to let client JS mutate DOM
+    const delay = new Promise(r => setTimeout(r, 1500));
+    await Promise.race([Promise.all([settle, delay]), new Promise(r => setTimeout(r, timeoutMs))]);
+
+    // remove scripts/styles to keep HTML clean-ish? (Your worker already strips, so keep raw)
+    const content = await page.content();
+    const finalUrl = page.url();
+
+    res.json({ html: content, url: finalUrl });
   } catch (e) {
-    return res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: String(e.message || e) });
   } finally {
-    if (browser) await browser.close();
+    if (browser) await browser.close().catch(() => {});
   }
 });
 
-const port = process.env.PORT || 8080;
-app.listen(port, "0.0.0.0", () => {
-  console.log("Deep Render listening on", port);
+app.listen(PORT, () => {
+  console.log(`Render API listening on :${PORT}`);
 });

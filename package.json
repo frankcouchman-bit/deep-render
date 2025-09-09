@@ -1,14 +1,14 @@
 {
   "name": "wcag-renderer",
   "version": "1.0.0",
-  "private": true,
   "type": "module",
+  "private": true,
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
     "express": "^4.19.2",
     "morgan": "^1.10.0",
-    "playwright": "^1.46.0"
+    "playwright": "1.46.0"
   }
 }

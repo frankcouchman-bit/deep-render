@@ -1,18 +1,15 @@
 import express from "express";
 import morgan from "morgan";
-import { chromium } from "playwright"; // use playwright (not -core) to match baked browsers
+import { chromium } from "playwright";
 
 const PORT = Number(process.env.PORT || 8080);
-
-// Optional bearer for your Worker to call this safely
-const API_KEY = process.env.RENDER_API_KEY || "";
+const API_KEY = process.env.RENDER_API_KEY || ""; // optional bearer
 
 const app = express();
 app.disable("x-powered-by");
 app.use(express.json({ limit: "1mb" }));
 app.use(morgan("tiny"));
 
-// Health
 app.get("/", (_req, res) => res.json({ ok: true, name: "wcag-renderer" }));
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
@@ -29,93 +26,91 @@ app.use((req, res, next) => {
  * Body: { url: string, waitUntil?: "domcontentloaded"|"load"|"networkidle", timeoutMs?: number }
  */
 app.post("/render", async (req, res) => {
+  const url = String(req.body?.url || "").trim();
+  const waitUntil = ["domcontentloaded", "load", "networkidle"].includes(req.body?.waitUntil)
+    ? req.body.waitUntil
+    : "networkidle";
+  const timeoutMs = Math.min(60000, Math.max(8000, Number(req.body?.timeoutMs || 30000)));
+
+  if (!/^https?:\/\//i.test(url)) return res.status(400).json({ error: "Invalid url" });
+
+  let browser;
   try {
-    const url = String(req.body?.url || "").trim();
-    const waitUntil =
-      ["domcontentloaded", "load", "networkidle"].includes(req.body?.waitUntil)
-        ? req.body.waitUntil
-        : "networkidle";
-    const timeoutMs = Math.min(60000, Math.max(8000, Number(req.body?.timeoutMs || 25000)));
-
-    if (!/^https?:\/\//i.test(url)) {
-      return res.status(400).json({ error: "Invalid url" });
-    }
-
-    const browser = await chromium.launch({
+    browser = await chromium.launch({
       headless: true,
       args: [
         "--no-sandbox",
         "--disable-setuid-sandbox",
         "--disable-dev-shm-usage",
         "--disable-gpu",
-        "--no-zygote"
+        "--no-zygote",
+        "--disable-blink-features=AutomationControlled"
       ]
     });
 
+    const context = await browser.newContext({
+      viewport: { width: 1366, height: 768 },
+      userAgent:
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) " +
+        "Chrome/120.0.0.0 Safari/537.36",
+      javaScriptEnabled: true,
+      ignoreHTTPSErrors: true,
+      locale: "en-US",
+      timezoneId: "UTC"
+    });
+
+    const page = await context.newPage();
+
+    // Light anti-bot hardening
+    await page.addInitScript(() => {
+      Object.defineProperty(navigator, "webdriver", { get: () => false });
+    });
+
+    // First try block heavy assets
+    await page.route("**/*", (route) => {
+      const type = route.request().resourceType();
+      if (["image", "media", "font"].includes(type)) return route.abort();
+      route.continue();
+    });
+
+    // Two-phase navigation
+    const tryNavigate = async (blockHeavy) => {
+      if (!blockHeavy) await page.unroute("**/*");
+      const resp = await page
+        .goto(url, { waitUntil: "domcontentloaded", timeout: timeoutMs })
+        .catch((e) => ({ _err: e }));
+      if (!resp || resp._err) throw new Error("Navigation failed or timed out");
+    };
+
     try {
-      const context = await browser.newContext({
-        viewport: { width: 1366, height: 768 },
-        userAgent:
-          "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) " +
-          "Chrome/120 Safari/537.36 A11yRenderer/1.0",
-        javaScriptEnabled: true,
-        ignoreHTTPSErrors: true,
-        locale: "en-US",
-        timezoneId: "UTC"
-      });
-
-      const page = await context.newPage();
-
-      // Speed-up: block heavy assets on first try
-      await page.route("**/*", (route) => {
-        const type = route.request().resourceType();
-        if (["image", "media", "font"].includes(type)) return route.abort();
-        route.continue();
-      });
-
-      // Try a two-phase navigation (with and without blocking)
-      const tryNavigate = async (blockHeavy) => {
-        if (!blockHeavy) await page.unroute("**/*");
-        const firstHop = await page
-          .goto(url, { waitUntil: "domcontentloaded", timeout: timeoutMs })
-          .catch((e) => ({ _err: e }));
-        if (!firstHop || firstHop._err) {
-          throw new Error("Navigation failed or timed out");
-        }
-      };
-
-      try {
-        await tryNavigate(true);
-      } catch {
-        await tryNavigate(false);
-      }
-
-      // Settle network a bit but don’t hang forever
-      await Promise.race([
-        page.waitForLoadState(waitUntil, { timeout: Math.min(timeoutMs, 20000) }).catch(() => {}),
-        new Promise((r) => setTimeout(r, Math.min(timeoutMs, 20000)))
-      ]);
-
-      // Let client JS mutate DOM briefly
-      await page.waitForTimeout(1500);
-
-      const html = await page.content();
-      const finalUrl = page.url();
-
-      await page.close().catch(() => {});
-      await context.close().catch(() => {});
-
-      return res.json({ html, url: finalUrl });
-    } finally {
-      await browser.close().catch(() => {});
+      await tryNavigate(true);
+    } catch {
+      await tryNavigate(false);
     }
+
+    // Wait to settle but cap wait time
+    await Promise.race([
+      page.waitForLoadState(waitUntil, { timeout: Math.min(timeoutMs, 25000) }).catch(() => {}),
+      new Promise((r) => setTimeout(r, Math.min(timeoutMs, 25000)))
+    ]);
+
+    await page.waitForTimeout(1500); // allow DOM mutations
+
+    const html = await page.content();
+    const finalUrl = page.url();
+
+    await page.close().catch(() => {});
+    await context.close().catch(() => {});
+
+    return res.json({ html, url: finalUrl });
   } catch (e) {
-    const msg = (e && e.message) ? e.message : String(e);
+    const msg = e?.message || String(e);
     return res.status(500).json({ error: msg });
+  } finally {
+    if (browser) await browser.close().catch(() => {});
   }
 });
 
-// Graceful shutdown (Render sends SIGTERM)
 const server = app.listen(PORT, () => {
   console.log(`Render API listening on :${PORT}`);
 });
